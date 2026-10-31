@@ -2477,6 +2477,126 @@ class TakeExamplesIterable(_BaseExamplesIterable):
         return self.ex_iterable.num_shards
 
 
+class TakeWhileExamplesIterable(_BaseExamplesIterable):
+    """Take the longest prefix of examples for which a predicate returns True.
+
+    The predicate is called on the examples in their input order. An example is
+    yielded while the predicate returns True, and iteration stops at the first
+    example for which it returns False: this example is not yielded and the
+    underlying iterable is not read further. Unlike filtering, the remaining
+    examples are not searched for more matches.
+
+    Each shard (e.g. a DataLoader worker or a distributed node) runs the predicate
+    independently on the examples it owns, hence each shard keeps its own prefix.
+    """
+
+    def __init__(
+        self,
+        ex_iterable: _BaseExamplesIterable,
+        predicate: Callable,
+        with_indices: bool = False,
+        input_columns: Optional[list[str]] = None,
+        fn_kwargs: Optional[dict] = None,
+        formatting: Optional["FormattingConfig"] = None,
+    ):
+        super().__init__()
+        if inspect.iscoroutinefunction(predicate):
+            raise TypeError(
+                "TakeWhileExamplesIterable expects a synchronous predicate function, but got an asynchronous one."
+            )
+        self.ex_iterable = ex_iterable
+        self.predicate = predicate
+        self.with_indices = with_indices
+        self.input_columns = input_columns
+        self.fn_kwargs = fn_kwargs or {}
+        self.formatting = formatting
+
+    @property
+    def iter_arrow(self):
+        # The predicate is evaluated one example at a time and iteration must stop
+        # as soon as it returns False, without reading the next example. Therefore
+        # arrow tables are never passed to the predicate: examples are consumed
+        # through __iter__ (decoded/formatted by FormattedExamplesIterable) instead.
+        return None
+
+    @property
+    def is_typed(self):
+        return self.ex_iterable.is_typed
+
+    @property
+    def features(self):
+        return self.ex_iterable.features
+
+    def _init_state_dict(self) -> dict:
+        self._state_dict = {
+            "examples_iterable": self.ex_iterable._init_state_dict(),
+            "next_example_idx": 0,
+            "finished": False,
+            "type": self.__class__.__name__,
+        }
+        return self._state_dict
+
+    def __iter__(self):
+        # A state saved after the predicate returned False resumes as an empty
+        # stream: the source is not iterated again, so its remaining examples
+        # (including the one that failed the predicate) are not re-read.
+        if self._state_dict and self._state_dict["finished"]:
+            return
+        next_example_idx = self._state_dict["next_example_idx"] if self._state_dict else 0
+        for key, example in self.ex_iterable:
+            # copy to make sure the original columns are left untouched
+            example = dict(example)
+            fn_args = [example] if self.input_columns is None else [example[column] for column in self.input_columns]
+            if self.with_indices:
+                fn_args.append(next_example_idx)
+            # An exception from the predicate propagates as-is and is not treated as a stop.
+            if self.predicate(*fn_args, **self.fn_kwargs):
+                if self._state_dict:
+                    self._state_dict["next_example_idx"] = next_example_idx + 1
+                next_example_idx += 1
+                yield key, example
+            else:
+                if self._state_dict:
+                    self._state_dict["finished"] = True
+                return
+
+    def shuffle_data_sources(self, generator: np.random.Generator) -> "TakeWhileExamplesIterable":
+        """Shuffle the wrapped examples iterable, then take the prefix."""
+        return TakeWhileExamplesIterable(
+            self.ex_iterable.shuffle_data_sources(generator),
+            predicate=self.predicate,
+            with_indices=self.with_indices,
+            input_columns=self.input_columns,
+            fn_kwargs=self.fn_kwargs,
+            formatting=self.formatting,
+        )
+
+    def shard_data_sources(self, num_shards: int, index: int, contiguous=True) -> "TakeWhileExamplesIterable":
+        """Keep only the requested shard. Each shard determines its own prefix independently."""
+        return TakeWhileExamplesIterable(
+            self.ex_iterable.shard_data_sources(num_shards, index, contiguous=contiguous),
+            predicate=self.predicate,
+            with_indices=self.with_indices,
+            input_columns=self.input_columns,
+            fn_kwargs=self.fn_kwargs,
+            formatting=self.formatting,
+        )
+
+    def reshard_data_sources(self) -> "TakeWhileExamplesIterable":
+        return TakeWhileExamplesIterable(
+            self.ex_iterable.reshard_data_sources(),
+            predicate=self.predicate,
+            with_indices=self.with_indices,
+            input_columns=self.input_columns,
+            fn_kwargs=self.fn_kwargs,
+            formatting=self.formatting,
+        )
+
+    @property
+    def num_shards(self) -> int:
+        return self.ex_iterable.num_shards
+
+
 def _apply_feature_types_on_example(
     example: dict, features: Features, token_per_repo_id: dict[str, Union[str, bool, None]]
 ) -> dict:
@@ -4170,6 +4290,102 @@ class IterableDataset(DatasetInfoMixin):
         return IterableDataset(
             ex_iterable=ex_iterable,
             info=self._info.copy(),
+            split=self._split,
+            formatting=self._formatting,
+            distributed=deepcopy(self._distributed),
+            token_per_repo_id=self._token_per_repo_id,
+        )
+
+    def take_while(
+        self,
+        predicate: Callable,
+        with_indices: bool = False,
+        input_columns: Optional[Union[str, list[str]]] = None,
+        fn_kwargs: Optional[dict] = None,
+    ) -> "IterableDataset":
+        """Create a new [`IterableDataset`] with the longest prefix of examples for which `predicate` returns `True`.
+
+        The predicate is called on each example in input order. Examples are
+        yielded while it returns `True`, and iteration stops at the first example
+        for which it returns `False`: that example is not included and the
+        remaining examples are not even read. This differs from
+        [`IterableDataset.filter`], which keeps evaluating the function on every
+        example and returns all the matches.
+
+        When the dataset is sharded (e.g. with several DataLoader workers or in a
+        distributed setting), the predicate is applied independently on each
+        shard, so every shard returns its own prefix.
+
+        The features and the columns of the examples are unchanged, so the result
+        can be further composed with [`IterableDataset.map`],
+        [`IterableDataset.filter`] and other transforms.
+
+        Args:
+            predicate (`Callable`):
+                Synchronous callable with one of the following signatures:
+
+                - `predicate(example: Dict[str, Any]) -> bool` if `with_indices=False`
+                - `predicate(example: Dict[str, Any], idx: int) -> bool` if `with_indices=True`
+
+                Asynchronous predicates are not supported. The predicate is expected
+                to return the same result for the same input, but its external side
+                effects are not saved in the state dict. If it raises an exception,
+                the exception is propagated as-is instead of stopping the iteration.
+            with_indices (`bool`, defaults to `False`):
+                Provide example indices to `predicate`. Note that in this case the signature of
+                `predicate` should be `def predicate(example, idx): ...`.
+            input_columns (`str` or `List[str]`, *optional*):
+                The columns to be passed into `predicate` as positional arguments.
+                If `None`, a dict mapping to all formatted columns is passed as one argument.
+            fn_kwargs (`Dict`, *optional*, default `None`):
+                Keyword arguments to be passed to `predicate`.
+
+        Example:
+
+        ```py
+        >>> from datasets import IterableDataset
+        >>> ds = IterableDataset.from_generator(lambda: ({"n": i} for i in [1, 2, 3, 0, 4]))
+        >>> list(ds.take_while(lambda x: x["n"] > 0))
+        [{'n': 1}, {'n': 2}, {'n': 3}]
+        ```
+        """
+        if isinstance(input_columns, str):
+            input_columns = [input_columns]
+
+        # We need the examples to be decoded for certain feature types like Image or Audio,
+        # format and type before running the predicate (same as in `filter`). Rebatching to
+        # one row ensures the source is never read past the example being evaluated, so
+        # stopping on the first False doesn't pull the following examples.
+        ex_iterable = self._ex_iterable
+        if self._info.features is not None:
+            # prefer the dataset features to avoid re-adding internal columns from a
+            # previous transform (e.g. the temporary mask column added by `filter`)
+            features = self._info.features
+        elif ex_iterable.is_typed:
+            features = ex_iterable.features
+        else:
+            features = None
+        if self._info.features or self._formatting:
+            if ex_iterable.iter_arrow:
+                ex_iterable = RebatchedArrowExamplesIterable(ex_iterable, batch_size=1)
+            ex_iterable = FormattedExamplesIterable(
+                ex_iterable,
+                formatting=self._formatting,
+                features=features,
+                token_per_repo_id=self._token_per_repo_id,
+            )
+
+        ex_iterable = TakeWhileExamplesIterable(
+            ex_iterable,
+            predicate=predicate,
+            with_indices=with_indices,
+            input_columns=input_columns,
+            fn_kwargs=fn_kwargs,
+            formatting=self._formatting,
+        )
+        return IterableDataset(
+            ex_iterable=ex_iterable,
+            info=self._info,
             split=self._split,
             formatting=self._formatting,
             distributed=deepcopy(self._distributed),

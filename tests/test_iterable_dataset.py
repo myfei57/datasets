@@ -53,6 +53,7 @@ from datasets.iterable_dataset import (
     SkipExamplesIterable,
     StepExamplesIterable,
     TakeExamplesIterable,
+    TakeWhileExamplesIterable,
     VerticallyConcatenatedMultiSourcesExamplesIterable,
     _BaseExamplesIterable,
     _batch_to_examples,
@@ -1661,6 +1662,182 @@ def test_take_arrow_examples_iterable():
     assert_load_state_dict_resumes_iteration(take_ex_iterable)
 
 
+class TakeWhilePredicateError(Exception):
+    pass
+
+
+def make_tracking_examples_iterable(values):
+    """An ExamplesIterable factory that records every example read from the source."""
+    reads = []
+
+    def generate_examples():
+        for value in values:
+            reads.append(value)
+            yield value, {"n": value}
+
+    return ExamplesIterable(generate_examples, {}), reads
+
+
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        ([], []),  # empty stream
+        ([0, 1, 2], []),  # first example doesn't match
+        ([1, 2, 3], [1, 2, 3]),  # every example matches
+        ([1, 2, 0, 1, 4], [1, 2]),  # stops at the first False, later matches are not searched
+    ],
+)
+def test_take_while_examples_iterable_prefix_and_reads(values, expected):
+    base_ex_iterable, reads = make_tracking_examples_iterable(values)
+    take_while_ex_iterable = TakeWhileExamplesIterable(base_ex_iterable, predicate=lambda x: x["n"] > 0)
+    assert [example["n"] for _, example in take_while_ex_iterable] == expected
+    # the matching prefix plus the first False example are read, nothing after it
+    expected_reads = values[: len(expected)] if expected == values else values[: len(expected) + 1]
+    assert reads == expected_reads
+    # resume from every checkpoint, including the initial and the final ones
+    base_ex_iterable, _ = make_tracking_examples_iterable(values)
+    assert_load_state_dict_resumes_iteration(
+        TakeWhileExamplesIterable(base_ex_iterable, predicate=lambda x: x["n"] > 0)
+    )
+
+
+def test_take_while_examples_iterable_keeps_columns_and_features():
+    base_ex_iterable = ExamplesIterable(generate_examples_fn, {})
+    take_while_ex_iterable = TakeWhileExamplesIterable(base_ex_iterable, predicate=lambda x: x["id"] < 3)
+    assert take_while_ex_iterable.features == base_ex_iterable.features
+    assert take_while_ex_iterable.is_typed == base_ex_iterable.is_typed
+    examples = [example for _, example in take_while_ex_iterable]
+    assert [example["id"] for example in examples] == [0, 1, 2]
+    assert all(set(example) == {"id"} for example in examples)
+
+
+def test_take_while_examples_iterable_input_columns_and_fn_kwargs():
+    base_ex_iterable, reads = make_tracking_examples_iterable([1, 2, 3, 0, 4])
+    take_while_ex_iterable = TakeWhileExamplesIterable(
+        base_ex_iterable,
+        predicate=lambda n, threshold: n < threshold,
+        input_columns=["n"],
+        fn_kwargs={"threshold": 3},
+    )
+    assert [example["n"] for _, example in take_while_ex_iterable] == [1, 2]
+    assert reads == [1, 2, 3]
+
+
+def test_take_while_examples_iterable_with_indices_continues_after_resume():
+    indices = []
+
+    def predicate(x, idx):
+        indices.append(idx)
+        return x["n"] > 0 and idx < 2
+
+    base, _ = make_tracking_examples_iterable([1, 2, 0, 3])
+    take_while_ex_iterable = TakeWhileExamplesIterable(base, predicate=predicate, with_indices=True)
+    take_while_ex_iterable._init_state_dict()
+    iterator = iter(take_while_ex_iterable)
+    assert next(iterator)[1]["n"] == 1
+    state_after_one = take_while_ex_iterable.state_dict()
+    assert state_after_one["next_example_idx"] == 1
+    assert next(iterator)[1]["n"] == 2
+    assert indices == [0, 1]
+
+    base_resumed, resumed_reads = make_tracking_examples_iterable([1, 2, 0, 3])
+    resumed_indices = []
+    resumed = TakeWhileExamplesIterable(
+        base_resumed,
+        predicate=lambda x, idx: resumed_indices.append(idx) or (x["n"] > 0 and idx < 2),
+        with_indices=True,
+    )
+    resumed.load_state_dict(state_after_one)
+    assert [example["n"] for _, example in resumed] == [2]
+    # the predicate keeps counting from the next input (1), including the first False example (2)
+    assert resumed_indices == [1, 2]
+    # the source replays the consumed prefix to seek to the checkpoint, but the tail after
+    # the first False is never read
+    assert resumed_reads == [1, 2, 0]
+
+
+def test_take_while_examples_iterable_predicate_exception_propagates():
+    def make_predicate(calls):
+        def predicate(x):
+            calls.append(x["n"])
+            if x["n"] == 2:
+                raise TakeWhilePredicateError("boom")
+            return True
+
+        return predicate
+
+    calls = []
+    base_ex_iterable, reads = make_tracking_examples_iterable([1, 2, 3])
+    take_while_ex_iterable = TakeWhileExamplesIterable(base_ex_iterable, predicate=make_predicate(calls))
+    take_while_ex_iterable._init_state_dict()
+    iterator = iter(take_while_ex_iterable)
+    assert next(iterator)[1]["n"] == 1
+    # checkpoint taken while everything is fine
+    good_state = take_while_ex_iterable.state_dict()
+    assert good_state["finished"] is False
+    assert good_state["next_example_idx"] == 1
+    # continuing raises the predicate error unchanged instead of stopping the stream
+    with pytest.raises(TakeWhilePredicateError, match="boom"):
+        list(iterator)
+    assert calls == [1, 2]
+    assert reads == [1, 2]
+
+    # resuming from the good checkpoint replays the failing input and raises again as-is
+    base_resumed, resumed_reads = make_tracking_examples_iterable([1, 2, 3])
+    resumed_calls = []
+    resumed = TakeWhileExamplesIterable(base_resumed, predicate=make_predicate(resumed_calls))
+    resumed.load_state_dict(good_state)
+    with pytest.raises(TakeWhilePredicateError, match="boom"):
+        list(resumed)
+    # the source replays the consumed prefix to seek to the checkpoint, then re-runs the failing input;
+    # the predicate itself is only called on that next input
+    assert resumed_reads == [1, 2]
+    assert resumed_calls == [2]
+
+
+def test_take_while_examples_iterable_resume_after_finished_stays_empty():
+    base_ex_iterable, reads = make_tracking_examples_iterable([1, 2, 0, 3, 4])
+    take_while_ex_iterable = TakeWhileExamplesIterable(base_ex_iterable, predicate=lambda x: x["n"] > 0)
+    take_while_ex_iterable._init_state_dict()
+    assert [example["n"] for _, example in take_while_ex_iterable] == [1, 2]
+    assert reads == [1, 2, 0]
+    finished_state = take_while_ex_iterable.state_dict()
+    assert finished_state["finished"] is True
+
+    base_resumed, resumed_reads = make_tracking_examples_iterable([1, 2, 0, 3, 4])
+    resumed = TakeWhileExamplesIterable(base_resumed, predicate=lambda x: x["n"] > 0)
+    resumed.load_state_dict(finished_state)
+    assert list(resumed) == []
+    # the source is not run again: neither the failing example nor the tail are read
+    assert resumed_reads == []
+
+
+def test_take_while_examples_iterable_shards_keep_their_own_prefix():
+    filepaths = ["0.txt", "1.txt", "2.txt"]
+    base_ex_iterable = ExamplesIterable(generate_examples_fn, {"filepaths": filepaths, "n": 5})
+    take_while_ex_iterable = TakeWhileExamplesIterable(base_ex_iterable, predicate=lambda x: x["id"] < 2)
+    assert take_while_ex_iterable.num_shards == 3
+    per_shard = [
+        [example["id"] for _, example in take_while_ex_iterable.shard_data_sources(3, index, contiguous=False)]
+        for index in range(3)
+    ]
+    # every shard applies the predicate independently to its own prefix
+    assert per_shard == [[0, 1], [0, 1], [0, 1]]
+
+    # a shard whose first example doesn't match yields nothing
+    base_ex_iterable = ExamplesIterable(generate_examples_fn, {"filepaths": filepaths, "n": 5})
+    take_while_ex_iterable = TakeWhileExamplesIterable(base_ex_iterable, predicate=lambda x: False)
+    assert [list(take_while_ex_iterable.shard_data_sources(3, index, contiguous=False)) for index in range(3)] == [
+        [],
+        [],
+        [],
+    ]
+
+    shuffled = take_while_ex_iterable.shuffle_data_sources(np.random.default_rng(42))
+    assert isinstance(shuffled, TakeWhileExamplesIterable)
+    assert isinstance(take_while_ex_iterable.reshard_data_sources(), TakeWhileExamplesIterable)
+
+
 def test_step_arrow_examples_iterable():
     total, step, offset = 10, 2, 1
     base_ex_iterable = ArrowExamplesIterable(generate_tables_fn, {"n": total})
@@ -2531,6 +2708,10 @@ def generate_numbered_shards(shards):
             yield {"id": 10 * shard + offset}
 
 
+def take_while_numbered_shards_prefix(example):
+    return example["id"] % 10 < 3
+
+
 def make_numbered_shards_dataset(source_type, num_shards):
     if source_type == "arrow":
         return IterableDataset.from_dict({"id": range(10 * num_shards)}, num_shards=num_shards)
@@ -3061,6 +3242,203 @@ def test_iterable_dataset_take(dataset: IterableDataset, n):
     assert isinstance(take_dataset._ex_iterable, TakeExamplesIterable)
     assert take_dataset._ex_iterable.n == n
     assert list(take_dataset) == list(dataset)[:n]
+
+
+def make_tracking_iterable_dataset(values):
+    """An IterableDataset factory that records every example read from the source."""
+    reads = []
+
+    def generate_examples():
+        for value in values:
+            reads.append(value)
+            yield {"n": value}
+
+    return IterableDataset.from_generator(generate_examples), reads
+
+
+def test_iterable_dataset_take_while(dataset: IterableDataset):
+    take_while_dataset = dataset.take_while(lambda x: x["id"] < 5)
+    assert isinstance(take_while_dataset._ex_iterable, TakeWhileExamplesIterable)
+    assert [example["id"] for example in take_while_dataset] == [0, 1, 2, 3, 4]
+    # unlike filter, the matching examples after the first False are not returned
+    filter_dataset = dataset.filter(lambda x: x["id"] >= 15)
+    take_while_dataset = dataset.take_while(lambda x: x["id"] < 15)
+    assert list(filter_dataset)[0] == next(iter(dataset.skip(15)))
+    assert [example["id"] for example in take_while_dataset] == list(range(15))
+
+
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        ([], []),  # empty stream
+        ([0, 1], []),  # first example doesn't match
+        ([1, 2, 3], [1, 2, 3]),  # every example matches
+        ([1, 0, 1], [1]),  # stops at the first False, the trailing match is dropped
+    ],
+)
+def test_iterable_dataset_take_while_boundaries_and_reads(values, expected):
+    dataset, reads = make_tracking_iterable_dataset(values)
+    take_while_dataset = dataset.take_while(lambda x: x["n"] > 0)
+    assert [example["n"] for example in take_while_dataset] == expected
+    expected_reads = values if expected == values else values[: len(expected) + 1]
+    assert reads == expected_reads
+
+
+def test_iterable_dataset_take_while_preserves_features_and_composes():
+    dataset = IterableDataset.from_dict({"a": [1, 2, 0, 3], "b": ["w", "x", "y", "z"]})
+    take_while_dataset = dataset.take_while(lambda x: x["a"] > 0)
+    assert take_while_dataset.features == dataset.features
+    assert take_while_dataset.column_names == ["a", "b"]
+    # the prefix can be further transformed with map and filter
+    composed = take_while_dataset.map(lambda x: {"a2": x["a"] ** 2}).filter(lambda x: x["a2"] > 1)
+    assert list(composed) == [{"a": 2, "b": "x", "a2": 4}]
+    # take_while can also be applied after another transform
+    after_map = dataset.map(lambda x: {"c": x["a"] + 1}).take_while(lambda x: x["c"] <= 2)
+    assert [example["c"] for example in after_map] == [2]
+    # the temporary mask column used by filter is not leaked
+    after_filter = dataset.filter(lambda x: x["a"] > 0).take_while(lambda x: x["a"] < 3)
+    assert list(after_filter) == [{"a": 1, "b": "w"}, {"a": 2, "b": "x"}]
+
+
+def test_iterable_dataset_take_while_arguments():
+    dataset, reads = make_tracking_iterable_dataset([1, 2, 3, 0])
+    with_indices_dataset = dataset.take_while(lambda x, idx: idx < 2, with_indices=True)
+    assert [example["n"] for example in with_indices_dataset] == [1, 2]
+
+    dataset, reads = make_tracking_iterable_dataset([1, 2, 3, 0])
+    input_columns_dataset = dataset.take_while(
+        lambda n, threshold: n < threshold, input_columns="n", fn_kwargs={"threshold": 3}
+    )
+    assert [example["n"] for example in input_columns_dataset] == [1, 2]
+    assert reads == [1, 2, 3]
+
+
+def test_iterable_dataset_take_while_predicate_exception_propagates():
+    dataset = IterableDataset.from_generator(lambda: ({"n": i} for i in [1, 2, 3]))
+
+    def predicate(example):
+        if example["n"] == 2:
+            raise TakeWhilePredicateError("boom")
+        return True
+
+    with pytest.raises(TakeWhilePredicateError, match="boom"):
+        list(dataset.take_while(predicate))
+
+
+def test_iterable_dataset_take_while_resume_state_dict():
+    dataset, _ = make_tracking_iterable_dataset([1, 2, 0, 3])
+    take_while_dataset = dataset.take_while(lambda x: x["n"] > 0)
+    iterator = iter(take_while_dataset)
+    seen = [next(iterator)["n"]]
+    state_dict = take_while_dataset.state_dict()
+
+    resumed_dataset, resumed_reads = make_tracking_iterable_dataset([1, 2, 0, 3])
+    resumed_dataset = resumed_dataset.take_while(lambda x: x["n"] > 0)
+    resumed_dataset.load_state_dict(state_dict)
+    rest = [example["n"] for example in resumed_dataset]
+    assert seen + rest == [1, 2]
+    # resume continues at the next input and stops again at the first False; the tail (3) is never read
+    assert resumed_reads == [1, 2, 0]
+
+
+def test_iterable_dataset_take_while_resume_after_finished_is_empty():
+    dataset, reads = make_tracking_iterable_dataset([1, 0, 2])
+    take_while_dataset = dataset.take_while(lambda x: x["n"] > 0)
+    assert [example["n"] for example in take_while_dataset] == [1]
+    state_dict = take_while_dataset.state_dict()
+    assert state_dict["examples_iterable"]["finished"] is True
+
+    resumed_dataset, resumed_reads = make_tracking_iterable_dataset([1, 0, 2])
+    resumed_dataset = resumed_dataset.take_while(lambda x: x["n"] > 0)
+    resumed_dataset.load_state_dict(state_dict)
+    assert list(resumed_dataset) == []
+    # the remaining part of the source is not re-run
+    assert resumed_reads == []
+
+
+@pytest.mark.parametrize("consume", [0, 1, 3, 5])
+def test_iterable_dataset_take_while_resume_state_dict_arrow(consume):
+    # same guarantee as `filter` resume: the source is read one example ahead, no row is skipped
+    n = 20
+
+    def make_dataset():
+        return (
+            Dataset.from_dict({"a": list(range(n))}).to_iterable_dataset(num_shards=1).take_while(lambda x: x["a"] < 5)
+        )
+
+    dataset = make_dataset()
+    iterator = iter(dataset)
+    seen = [next(iterator)["a"] for _ in range(consume)]
+    state_dict = dataset.state_dict()
+    resumed_dataset = make_dataset()
+    resumed_dataset.load_state_dict(state_dict)
+    rest = [example["a"] for example in resumed_dataset]
+    assert seen + rest == [0, 1, 2, 3, 4]
+
+
+def test_iterable_dataset_take_while_numpy_format():
+    dataset = Dataset.from_dict({"a": list(range(6))}).to_iterable_dataset().with_format("numpy")
+    output = list(dataset.take_while(lambda x: x["a"] < 3))
+    assert [int(example["a"]) for example in output] == [0, 1, 2]
+
+
+def test_iterable_dataset_take_while_arrow_format():
+    dataset = Dataset.from_dict({"a": list(range(6))}).to_iterable_dataset().with_format("arrow")
+    take_while_dataset = dataset.take_while(lambda x: x["a"] < 3)
+    # predicate runs on python examples, the user-facing format stays arrow
+    rows = list(take_while_dataset)
+    assert all(isinstance(row, pa.Table) for row in rows)
+    assert [row["a"].to_pylist()[0] for row in rows] == [0, 1, 2]
+    assert list(take_while_dataset.with_format(None)) == [{"a": 0}, {"a": 1}, {"a": 2}]
+
+
+@pytest.mark.parametrize("source_type", ["python", "arrow"])
+@pytest.mark.parametrize("take_while_before_split", [False, True])
+def test_iterable_dataset_take_while_split_by_node(source_type, take_while_before_split):
+    # one shard per node: each node runs the predicate independently on its own shard
+    dataset = make_numbered_shards_dataset(source_type, num_shards=2)
+    if take_while_before_split:
+        dataset = dataset.take_while(take_while_numbered_shards_prefix)
+
+    per_node = []
+    for rank in range(2):
+        node = split_dataset_by_node(dataset, rank=rank, world_size=2)
+        if not take_while_before_split:
+            node = node.take_while(take_while_numbered_shards_prefix)
+        per_node.append(sorted(example["id"] for example in node))
+
+    assert per_node == [[0, 1, 2], [10, 11, 12]]
+
+
+@pytest.mark.parametrize("source_type", ["python", "arrow"])
+def test_iterable_dataset_take_while_split_by_node_stops_over_assigned_shards(source_type):
+    # rank 0 owns two non-contiguous shards; the predicate stops the whole node stream at the
+    # first False, so the second assigned shard is not read (one prefix judgment per node stream)
+    dataset = make_numbered_shards_dataset(source_type, num_shards=4)
+    per_node = []
+    for rank in range(2):
+        node = split_dataset_by_node(dataset, rank=rank, world_size=2)
+        node = node.take_while(take_while_numbered_shards_prefix)
+        per_node.append(sorted(example["id"] for example in node))
+
+    assert per_node == [[0, 1, 2], [10, 11, 12]]
+
+
+@require_torch
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_iterable_dataset_take_while_dataloader_workers(num_workers):
+    from torch.utils.data import DataLoader
+
+    dataset = make_numbered_shards_dataset("python", num_shards=2)
+    take_while_dataset = dataset.take_while(take_while_numbered_shards_prefix)
+    output = list(DataLoader(take_while_dataset, batch_size=None, num_workers=num_workers))
+    ids = sorted(example["id"] for example in output)
+    if num_workers == 0:
+        # one single stream: the first False stops it before the second shard is read
+        assert ids == [0, 1, 2]
+    else:
+        # every worker evaluates the predicate on its own shard independently
+        assert ids == [0, 1, 2, 10, 11, 12]
 
 
 @pytest.mark.parametrize("n", [0, 2])
