@@ -2477,6 +2477,127 @@ class TakeExamplesIterable(_BaseExamplesIterable):
         return self.ex_iterable.num_shards
 
 
+# Type tags used to compare adjacent dedup keys. Tagging the actual type makes sure values that
+# compare equal in Python are not conflated, e.g. ``bool`` is a subclass of ``int`` so ``True == 1``.
+_DEDUP_KEY_TAG_NONE = 0
+_DEDUP_KEY_TAG_BOOL = 1
+_DEDUP_KEY_TAG_INT = 2
+_DEDUP_KEY_TAG_STR = 3
+
+
+def _tag_dedup_key_value(value: Any, column_name: str, example_idx: int) -> tuple[int, Any]:
+    """Tag a key value with its type so that ``True``/``False`` are not confused with ``1``/``0``."""
+    # ``bool`` must be checked before ``int`` since ``isinstance(True, int)`` is ``True``.
+    if value is None:
+        return (_DEDUP_KEY_TAG_NONE, None)
+    elif isinstance(value, bool):
+        return (_DEDUP_KEY_TAG_BOOL, value)
+    elif isinstance(value, int):
+        return (_DEDUP_KEY_TAG_INT, value)
+    elif isinstance(value, str):
+        return (_DEDUP_KEY_TAG_STR, value)
+    else:
+        raise TypeError(
+            f"Unsupported key value of type {type(value).__name__} for key column {column_name!r} at example "
+            f"position {example_idx} in the dataset stream: key values must be of type str, int, bool or None."
+        )
+
+
+class DeduplicatedExamplesIterable(_BaseExamplesIterable):
+    """Drop samples that are immediately preceded by another sample with the same key.
+
+    Contrary to a global deduplication, this iterable only compares each sample to the previous
+    one, so it runs in a streaming fashion without buffering the dataset: a key that shows up again
+    after other keys in between is kept again. It assumes the input samples are already ordered by
+    the key columns.
+    """
+
+    def __init__(self, ex_iterable: _BaseExamplesIterable, key_columns: list[str]):
+        super().__init__()
+        key_columns = [key_columns] if isinstance(key_columns, str) else list(key_columns)
+        if not key_columns:
+            raise ValueError("At least one key column must be provided to deduplicate adjacent examples.")
+        if any(not isinstance(column_name, str) for column_name in key_columns):
+            raise ValueError("Key column names must be strings.")
+        self.ex_iterable = ex_iterable
+        self.key_columns = key_columns
+
+    @property
+    def iter_arrow(self):
+        # Keys are compared row by row, so the arrow fast path is not used (samples and features
+        # are still preserved by FormattedExamplesIterable wrapping this iterable).
+        return None
+
+    @property
+    def is_typed(self):
+        return self.ex_iterable.is_typed
+
+    @property
+    def features(self):
+        return self.ex_iterable.features
+
+    def _init_state_dict(self) -> dict:
+        self._state_dict = {
+            "examples_iterable": self.ex_iterable._init_state_dict(),
+            # None means no sample has been kept yet; actual keys are always tuples so they can't collide.
+            "previous_key": None,
+            # Number of samples read from the (possibly sharded) source stream, i.e. source iterator position.
+            "example_idx": 0,
+            "type": self.__class__.__name__,
+        }
+        return self._state_dict
+
+    def _build_key(self, example: dict, example_idx: int) -> tuple[tuple[int, Any], ...]:
+        key = []
+        for column_name in self.key_columns:
+            if column_name not in example:
+                raise KeyError(
+                    f"Key column {column_name!r} is missing from the example at position {example_idx} "
+                    f"in the dataset stream."
+                )
+            key.append(_tag_dedup_key_value(example[column_name], column_name, example_idx))
+        return tuple(key)
+
+    def __iter__(self):
+        if self._state_dict:
+            previous_key = self._state_dict["previous_key"]
+            example_idx = self._state_dict["example_idx"]
+        else:
+            previous_key = None
+            example_idx = 0
+        # Normalize in case the state was restored from a format that turned tuples into lists (e.g. JSON).
+        if previous_key is not None:
+            previous_key = tuple(tuple(tagged_value) for tagged_value in previous_key)
+        for key, example in self.ex_iterable:
+            current_key = self._build_key(example, example_idx)
+            example_idx += 1
+            if self._state_dict:
+                self._state_dict["example_idx"] = example_idx
+            if current_key != previous_key:
+                # Update the previous key before yielding so the state matches the yielded sample.
+                if self._state_dict:
+                    self._state_dict["previous_key"] = current_key
+                yield key, example
+            previous_key = current_key
+
+    def shuffle_data_sources(self, generator: np.random.Generator) -> "DeduplicatedExamplesIterable":
+        """Deduplicate the shuffled wrapped examples iterable independently on each stream."""
+        return DeduplicatedExamplesIterable(self.ex_iterable.shuffle_data_sources(generator), self.key_columns)
+
+    def shard_data_sources(self, num_shards: int, index: int, contiguous=True) -> "DeduplicatedExamplesIterable":
+        """Keep only the requested shard and deduplicate that stream independently."""
+        return DeduplicatedExamplesIterable(
+            self.ex_iterable.shard_data_sources(num_shards, index, contiguous=contiguous), self.key_columns
+        )
+
+    def reshard_data_sources(self) -> "DeduplicatedExamplesIterable":
+        return DeduplicatedExamplesIterable(self.ex_iterable.reshard_data_sources(), self.key_columns)
+
+    @property
+    def num_shards(self) -> int:
+        return self.ex_iterable.num_shards
+
+
 def _apply_feature_types_on_example(
     example: dict, features: Features, token_per_repo_id: dict[str, Union[str, bool, None]]
 ) -> dict:
@@ -4167,6 +4288,48 @@ class IterableDataset(DatasetInfoMixin):
             n,
             split_when_sharding=self._distributed is None,
         )
+        return IterableDataset(
+            ex_iterable=ex_iterable,
+            info=self._info.copy(),
+            split=self._split,
+            formatting=self._formatting,
+            distributed=deepcopy(self._distributed),
+            token_per_repo_id=self._token_per_repo_id,
+        )
+
+    def deduplicate(self, keys: Union[str, list[str]]) -> "IterableDataset":
+        """
+        Drop consecutive duplicate samples, keeping the first sample of each run of equal keys.
+
+        The dataset is expected to be already sorted/grouped by `keys` (e.g. data ordered by a
+        business key). Only a sample immediately following another one with the same key is dropped:
+        if the same key appears again after other keys in between, it is kept again. This is a
+        streaming operation, so the whole dataset is not read ahead nor buffered — only the key of
+        the previous sample and the iterator position are kept in memory.
+
+        Key values can be strings, integers, booleans or `None`. Values of different types are never
+        considered equal, in particular booleans are not conflated with integers (``True != 1`` and
+        ``False != 0``). A missing key column or an unsupported key value raises an error mentioning
+        the corresponding column and the sample position.
+
+        When iterated with multiple workers or over distributed shards, each stream is deduplicated
+        independently — duplicates are not removed across different shards.
+
+        Args:
+            keys (`str` or `list[str]`):
+                Name of one or several existing columns to use as the key. Samples with equal key
+                tuples that are right next to each other are collapsed into the first one.
+
+        Example:
+
+        ```py
+        >>> from datasets import Dataset
+        >>> ds = Dataset.from_dict({"k": [1, 1, 2, 1, None, None], "v": list(range(6))}).to_iterable_dataset()
+        >>> list(ds.deduplicate("k"))
+        [{'k': 1, 'v': 0}, {'k': 2, 'v': 2}, {'k': 1, 'v': 3}, {'k': None, 'v': 4}]
+        ```
+        """
+        ex_iterable = DeduplicatedExamplesIterable(self._ex_iterable, key_columns=keys)
         return IterableDataset(
             ex_iterable=ex_iterable,
             info=self._info.copy(),

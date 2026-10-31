@@ -38,6 +38,7 @@ from datasets.iterable_dataset import (
     BufferShuffledExamplesIterable,
     CyclingMultiSourcesExamplesIterable,
     DataSourcesShufflingDisallowed,
+    DeduplicatedExamplesIterable,
     ExamplesIterable,
     FilteredExamplesIterable,
     FormattedExamplesIterable,
@@ -1607,6 +1608,135 @@ def test_take_examples_iterable():
     assert_load_state_dict_resumes_iteration(take_ex_iterable)
 
 
+def _rows_examples_fn(rows):
+    def generate_examples_fn(**kwargs):
+        for idx, row in enumerate(rows):
+            yield idx, dict(row)
+
+    return generate_examples_fn
+
+
+def test_deduplicated_examples_iterable():
+    # consecutive duplicates are collapsed, non-consecutive reappearances kept; None, bool vs int
+    # and str vs int are never conflated
+    rows = [
+        {"k": 1, "v": "a"},
+        {"k": 1, "v": "b"},  # consecutive duplicate -> dropped
+        {"k": 2, "v": "c"},
+        {"k": 1, "v": "d"},  # 1 comes back after 2 -> kept again
+        {"k": 1, "v": "e"},  # consecutive duplicate -> dropped
+        {"k": None, "v": "f"},
+        {"k": None, "v": "g"},  # consecutive None -> dropped
+        {"k": True, "v": "h"},
+        {"k": 1, "v": "i"},  # True != 1 -> kept
+        {"k": True, "v": "j"},  # 1 != True -> kept
+        {"k": False, "v": "k"},
+        {"k": 0, "v": "l"},  # False != 0 -> kept
+        {"k": "x", "v": "m"},
+        {"k": "x", "v": "n"},  # consecutive str duplicate -> dropped
+        {"k": "1", "v": "o"},  # "1" != "x" and "1" != 1 -> kept
+    ]
+    base_ex_iterable = ExamplesIterable(_rows_examples_fn(rows), {})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, "k")
+    expected = [rows[i] for i in [0, 2, 3, 5, 7, 8, 9, 10, 11, 12, 14]]
+    assert [example for _, example in ex_iterable] == expected
+    # a list of key columns behaves the same as a single string
+    base_ex_iterable = ExamplesIterable(_rows_examples_fn(rows), {})
+    assert [example for _, example in DeduplicatedExamplesIterable(base_ex_iterable, ["k"])] == expected
+    resumed_ex_iterable = DeduplicatedExamplesIterable(ExamplesIterable(_rows_examples_fn(rows), {}), "k")
+    assert_load_state_dict_resumes_iteration(resumed_ex_iterable)
+
+
+def test_deduplicated_examples_iterable_multiple_keys():
+    rows = [
+        {"a": 1, "b": True},
+        {"a": 1, "b": True},  # same tuple -> dropped
+        {"a": 1, "b": False},  # different b -> kept (and bool/int stay distinct in tuples)
+        {"a": 1, "b": True},  # previous is (1, False) -> kept again
+    ]
+    base_ex_iterable = ExamplesIterable(_rows_examples_fn(rows), {})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, ["a", "b"])
+    assert [example for _, example in ex_iterable] == [rows[0], rows[2], rows[3]]
+    resumed_ex_iterable = DeduplicatedExamplesIterable(ExamplesIterable(_rows_examples_fn(rows), {}), ["a", "b"])
+    assert_load_state_dict_resumes_iteration(resumed_ex_iterable)
+
+
+def test_deduplicated_examples_iterable_empty():
+    def empty_examples_fn(**kwargs):
+        yield from ()
+
+    base_ex_iterable = ExamplesIterable(empty_examples_fn, {})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, "k")
+    assert list(ex_iterable) == []
+    assert_load_state_dict_resumes_iteration(ex_iterable)
+
+
+def test_deduplicated_examples_iterable_missing_column():
+    rows = [{"other": 0}, {"other": 1}]
+    base_ex_iterable = ExamplesIterable(_rows_examples_fn(rows), {})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, "k")
+    with pytest.raises(KeyError, match=r"'k'.*position 0"):
+        list(ex_iterable)
+    # position points at the first example missing the column, not always 0
+    rows = [{"k": 0}, {"k": 0}, {"other": 2}]
+    base_ex_iterable = ExamplesIterable(_rows_examples_fn(rows), {})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, "k")
+    with pytest.raises(KeyError, match=r"'k'.*position 2"):
+        list(ex_iterable)
+
+
+@pytest.mark.parametrize("unsupported_value", [1.5, ["a"], {"a": 1}, object()])
+def test_deduplicated_examples_iterable_unsupported_value(unsupported_value):
+    rows = [{"k": 1}, {"k": unsupported_value}]
+    base_ex_iterable = ExamplesIterable(_rows_examples_fn(rows), {})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, "k")
+    with pytest.raises(TypeError, match=r"position 1.*str, int, bool or None"):
+        list(ex_iterable)
+
+
+def test_deduplicated_examples_iterable_requires_key_columns():
+    base_ex_iterable = ExamplesIterable(generate_examples_fn, {"n": 3})
+    with pytest.raises(ValueError):
+        DeduplicatedExamplesIterable(base_ex_iterable, [])
+
+
+def test_deduplicated_examples_iterable_state_dict_is_serializable():
+    rows = [{"k": 1}, {"k": 1}, {"k": None}, {"k": None}, {"k": True}, {"k": 1}]
+    base_ex_iterable = ExamplesIterable(_rows_examples_fn(rows), {})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, "k")
+    ex_iterable._init_state_dict()
+    iterator = iter(ex_iterable)
+    next(iterator)
+    next(iterator)
+    # the state only keeps the previous key and the source iterator position
+    state = json.loads(json.dumps(ex_iterable.state_dict()))
+    assert state["type"] == "DeduplicatedExamplesIterable"
+    assert state["example_idx"] == 3
+    assert state["previous_key"] == [[0, None]]
+    ex_iterable.load_state_dict(state)
+    # the next None is still a consecutive duplicate and is dropped, even though JSON turned tuples into lists
+    assert [example for _, example in ex_iterable] == [rows[4], rows[5]]
+
+
+def test_deduplicated_examples_iterable_sharding_is_independent():
+    filepaths = ["0.txt", "1.txt"]
+
+    def generate_examples_fn(**kwargs):
+        for filepath in kwargs["filepaths"]:
+            for i in range(3):
+                yield f"{filepath}_{i}", {"k": 1, "filepath": filepath, "i": i}
+
+    base_ex_iterable = ExamplesIterable(generate_examples_fn, {"filepaths": filepaths})
+    ex_iterable = DeduplicatedExamplesIterable(base_ex_iterable, "k")
+    shards = [
+        [example for _, example in ex_iterable.shard_data_sources(2, index, contiguous=True)] for index in range(2)
+    ]
+    # each shard keeps its own first sample even though every sample has the same key
+    assert len(shards[0]) == 1
+    assert len(shards[1]) == 1
+    assert {shards[0][0]["filepath"], shards[1][0]["filepath"]} == set(filepaths)
+
+
 @pytest.mark.parametrize("num_sources, num_shards", [(1, 2), (2, 3), (3, 3)])
 @pytest.mark.parametrize("contiguous", [False, True])
 @pytest.mark.parametrize("ex_iterable_cls", [SkipExamplesIterable, TakeExamplesIterable])
@@ -3061,6 +3191,82 @@ def test_iterable_dataset_take(dataset: IterableDataset, n):
     assert isinstance(take_dataset._ex_iterable, TakeExamplesIterable)
     assert take_dataset._ex_iterable.n == n
     assert list(take_dataset) == list(dataset)[:n]
+
+
+def test_iterable_dataset_deduplicate():
+    data = {"k": [1, 1, 2, 1, None, None], "v": ["a", "b", "c", "d", "e", "f"]}
+    expected = [
+        {"k": 1, "v": "a"},
+        {"k": 2, "v": "c"},
+        {"k": 1, "v": "d"},
+        {"k": None, "v": "e"},
+    ]
+    ds = Dataset.from_dict(data).to_iterable_dataset(num_shards=1)
+    dedup_dataset = ds.deduplicate("k")
+    assert isinstance(dedup_dataset._ex_iterable, DeduplicatedExamplesIterable)
+    assert dedup_dataset._ex_iterable.key_columns == ["k"]
+    assert list(dedup_dataset) == expected
+    # full features and all other columns are preserved
+    assert dedup_dataset.features == ds.features
+    assert dedup_dataset.column_names == ["k", "v"]
+    # a list of key columns is accepted too
+    assert list(Dataset.from_dict(data).to_iterable_dataset(num_shards=1).deduplicate(["k"])) == expected
+
+
+def test_iterable_dataset_deduplicate_types_and_empty():
+    # untyped generator so booleans, integers, strings and None keep their actual Python type
+    rows = [
+        {"k": True, "v": 0},
+        {"k": 1, "v": 1},  # True != 1
+        {"k": 1, "v": 2},  # consecutive 1 -> dropped
+        {"k": False, "v": 3},  # 1 != False
+        {"k": 0, "v": 4},  # False != 0
+        {"k": "0", "v": 5},  # 0 != "0"
+    ]
+
+    def generate_examples_fn():
+        for idx, row in enumerate(rows):
+            yield idx, row
+
+    ds = IterableDataset(ExamplesIterable(lambda **_: generate_examples_fn(), {}))
+    assert list(ds.deduplicate("k")) == [rows[i] for i in [0, 1, 3, 4, 5]]
+
+    def empty_examples_fn():
+        yield from ()
+
+    empty_ds = IterableDataset(ExamplesIterable(lambda **_: empty_examples_fn(), {}))
+    assert list(empty_ds.deduplicate("k")) == []
+
+
+def test_iterable_dataset_deduplicate_resume_state_dict():
+    # Checkpointing in the middle of a run of duplicates and resuming gives the same output as a
+    # single uninterrupted iteration.
+    data = {"k": [1, 1, 1, 2, 2, 3], "v": list(range(6))}
+    ds = Dataset.from_dict(data).to_iterable_dataset(num_shards=1).deduplicate("k")
+    iterator = iter(ds)
+    seen = [next(iterator)["v"]]
+    state_dict = ds.state_dict()
+    resumed = Dataset.from_dict(data).to_iterable_dataset(num_shards=1).deduplicate("k")
+    resumed.load_state_dict(state_dict)
+    rest = [example["v"] for example in resumed]
+    assert seen + rest == [0, 3, 5]
+    assert list(Dataset.from_dict(data).to_iterable_dataset(num_shards=1).deduplicate("k")) == [
+        {"k": 1, "v": 0},
+        {"k": 2, "v": 3},
+        {"k": 3, "v": 5},
+    ]
+
+
+def test_iterable_dataset_deduplicate_errors():
+    missing_rows = [{"other": 0}]
+    ds = IterableDataset(ExamplesIterable(_rows_examples_fn(missing_rows), {}))
+    with pytest.raises(KeyError, match=r"'k'.*position 0"):
+        list(ds.deduplicate("k"))
+
+    rows = [{"k": 0}, {"k": 1.5}]
+    ds = IterableDataset(ExamplesIterable(_rows_examples_fn(rows), {}))
+    with pytest.raises(TypeError, match=r"float.*'k'.*position 1"):
+        list(ds.deduplicate("k"))
 
 
 @pytest.mark.parametrize("n", [0, 2])
