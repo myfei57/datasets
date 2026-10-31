@@ -4104,6 +4104,341 @@ def test_iterable_dataset_batch_formatted_python_iterable_nullable_and_empty_lis
     assert [int(v) for v in batched[0]["lst"][1]] == [1, 2]
 
 
+def _greedy_pack_by_length(lengths, max_length, batch_size, too_long="error"):
+    """Reference greedy packing in input order, with the same semantics as batch_by_length."""
+    batches = []
+    buffer = []
+    total = 0
+    for index, length in enumerate(lengths):
+        if length > max_length:
+            if too_long == "error":
+                raise ValueError(f"Sample at position {index} is too long")
+            if buffer:
+                batches.append(buffer)
+                buffer, total = [], 0
+            batches.append([index])
+            continue
+        if buffer and (len(buffer) >= batch_size or total + length > max_length):
+            batches.append(buffer)
+            buffer, total = [], 0
+        buffer.append(index)
+        total += length
+    if buffer:
+        batches.append(buffer)
+    return batches
+
+
+@pytest.mark.parametrize(
+    "lengths,max_length,batch_size,num_shards",
+    [
+        ([3, 3, 4, 1, 2, 5], 8, 4, 1),
+        ([3, 3, 4, 1, 2, 5], 8, 4, 2),
+        ([3, 3, 4, 1, 2, 5], 8, 4, 3),
+        ([3, 3, 4, 1, 2, 5, 0, 8], 8, 4, 7),
+        ([1, 1, 1, 1, 1], 10, 2, 3),
+        ([5, 5, 5], 10, 2, 3),
+        ([2, 8, 2, 9, 1], 10, 3, 2),
+        ([4, 4, 2, 0, 1, 3, 6, 4, 0, 0, 10], 10, 3, 3),
+        ([2, 2, 2], 6, 5, 2),  # exact length fit, only the sample count can flush
+    ],
+)
+def test_iterable_dataset_batch_by_length_packing(lengths, max_length, batch_size, num_shards):
+    def make():
+        n = len(lengths)
+        return IterableDataset.from_dict(
+            {
+                "id": list(range(n)),
+                "length": lengths,
+                "tokens": [[i] * length for i, length in enumerate(lengths)],
+            },
+            num_shards=num_shards,
+        ).batch_by_length(length_column_name="length", max_length=max_length, batch_size=batch_size)
+
+    batches = list(make())
+    expected_indexes = _greedy_pack_by_length(lengths, max_length, batch_size)
+
+    assert [batch["id"] for batch in batches] == expected_indexes
+    for batch, indexes in zip(batches, expected_indexes):
+        assert len(batch["id"]) <= batch_size
+        assert sum(batch["length"]) <= max_length
+        # input order is preserved and all columns (including nested ones) come through untouched
+        assert batch["id"] == indexes
+        assert batch["length"] == [lengths[i] for i in indexes]
+        assert batch["tokens"] == [[i] * lengths[i] for i in indexes]
+    # the tail batch is kept even when it is smaller
+    assert batches[-1]["id"] == expected_indexes[-1]
+    # resuming never duplicates or loses samples, at every possible checkpoint
+    for consumed in range(len(expected_indexes) + 1):
+        ds = make()
+        iterator = iter(ds)
+        seen = [next(iterator)["id"] for _ in range(consumed)]
+        state_dict = ds.state_dict()
+        resumed = make()
+        resumed.load_state_dict(state_dict)
+        rest = [batch["id"] for batch in resumed]
+        assert seen + rest == expected_indexes, (consumed, seen, rest)
+
+
+def test_iterable_dataset_batch_by_length_zero_length_samples():
+    # zero-length samples still count towards batch_size
+    ds = IterableDataset.from_dict({"id": list(range(7)), "length": [0] * 7})
+    batches = list(ds.batch_by_length(length_column_name="length", max_length=0, batch_size=3))
+    assert [batch["id"] for batch in batches] == [[0, 1, 2], [3, 4, 5], [6]]
+
+    # with max_length=0, any positive-length sample is oversized
+    ds = IterableDataset.from_dict({"id": list(range(4)), "length": [0, 1, 0, 2]})
+    with pytest.raises(ValueError, match=r"position 1"):
+        list(ds.batch_by_length(length_column_name="length", max_length=0, batch_size=3))
+    batches = list(ds.batch_by_length(length_column_name="length", max_length=0, batch_size=3, too_long="keep"))
+    assert [batch["id"] for batch in batches] == [[0], [1], [2], [3]]
+
+
+def test_iterable_dataset_batch_by_length_too_long():
+    ds = IterableDataset.from_dict({"id": list(range(5)), "length": [2, 11, 3, 12, 4]})
+
+    # default policy raises and points at the offending sample position
+    with pytest.raises(ValueError, match=r"position 1.*11"):
+        list(ds.batch_by_length(length_column_name="length", max_length=10, batch_size=4))
+
+    # keep policy: the current batch is flushed first, then the oversized sample is its own batch
+    batches = list(ds.batch_by_length(length_column_name="length", max_length=10, batch_size=4, too_long="keep"))
+    assert [batch["id"] for batch in batches] == [[0], [1], [2], [3], [4]]
+    # the original sample is preserved in the singleton batch
+    assert batches[1]["length"] == [11]
+    assert batches[3]["length"] == [12]
+
+    # an oversized first sample is a singleton batch on its own
+    ds = IterableDataset.from_dict({"id": list(range(2)), "length": [99, 1]})
+    batches = list(ds.batch_by_length(length_column_name="length", max_length=10, batch_size=4, too_long="keep"))
+    assert [batch["id"] for batch in batches] == [[0], [1]]
+
+    with pytest.raises(ValueError, match="too_long"):
+        ds.batch_by_length(length_column_name="length", max_length=10, batch_size=4, too_long="nope")
+
+
+@pytest.mark.parametrize(
+    "values,bad_position",
+    [
+        ([1, 2, None], 2),
+        ([1, 2, -1], 2),
+        ([1, 2, True], 2),
+        ([False, 1], 0),
+        ([1, 2, 1.5], 2),
+        ([1, 2, 1.0], 2),
+        ([1, "2"], 1),
+    ],
+)
+def test_iterable_dataset_batch_by_length_invalid_length(values, bad_position):
+    def make(values=values):
+        return IterableDataset.from_generator(
+            lambda values=values: ({"id": i, "length": value} for i, value in enumerate(values))
+        )
+
+    with pytest.raises(ValueError, match=rf"position {bad_position}"):
+        list(make().batch_by_length(length_column_name="length", max_length=10, batch_size=4))
+
+
+def test_iterable_dataset_batch_by_length_missing_column():
+    # typed dataset: fail before iterating
+    ds = IterableDataset.from_dict({"id": [0, 1]})
+    with pytest.raises(ValueError, match="not found in the dataset columns"):
+        ds.batch_by_length(length_column_name="length", max_length=10, batch_size=4)
+
+    # untyped dataset: fail at the first sample, pointing at its position
+    ds = IterableDataset.from_generator(lambda: ({"id": i} for i in range(3)))
+    with pytest.raises(ValueError, match=r"position 0.*missing the length column 'length'"):
+        list(ds.batch_by_length(length_column_name="length", max_length=10, batch_size=4))
+
+
+def test_iterable_dataset_batch_by_length_accepts_numpy_integer():
+    ds = IterableDataset.from_generator(lambda: ({"id": i, "length": np.int64(2)} for i in range(3)))
+    batches = list(ds.batch_by_length(length_column_name="length", max_length=5, batch_size=2))
+    assert [batch["id"] for batch in batches] == [[0, 1], [2]]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"length_column_name": 3, "max_length": 1, "batch_size": 1},
+        {"length_column_name": "length", "max_length": -1, "batch_size": 1},
+        {"length_column_name": "length", "max_length": True, "batch_size": 1},
+        {"length_column_name": "length", "max_length": 1.0, "batch_size": 1},
+        {"length_column_name": "length", "max_length": 1, "batch_size": 0},
+        {"length_column_name": "length", "max_length": 1, "batch_size": -2},
+        {"length_column_name": "length", "max_length": 1, "batch_size": False},
+    ],
+)
+def test_iterable_dataset_batch_by_length_bad_arguments(kwargs):
+    ds = IterableDataset.from_dict({"id": [0, 1], "length": [1, 1]})
+    with pytest.raises((ValueError, TypeError)):
+        ds.batch_by_length(**kwargs)
+
+
+def test_iterable_dataset_batch_by_length_features():
+    ds = IterableDataset.from_dict(
+        {"id": [0, 1, 2], "length": [1, 2, 3], "tokens": [[1], [2, 2], [3, 3, 3]]}
+    )._resolve_features()
+
+    batched = ds.batch_by_length(length_column_name="length", max_length=5, batch_size=10)
+    # output columns and nested Features are the same as for a regular batch
+    assert batched.features == Features(
+        {
+            "id": [Value("int64")],
+            "length": [Value("int64")],
+            "tokens": [[Value("int64")]],
+        }
+    )
+    assert batched.features == ds.batch(batch_size=2).features
+    assert [batch["id"] for batch in batched] == [[0, 1], [2]]
+
+    # untyped input: features are None until resolved, then inferred as List(...) features
+    untyped = IterableDataset.from_generator(lambda: ({"id": i, "length": i + 1} for i in range(3))).batch_by_length(
+        length_column_name="length", max_length=5, batch_size=10
+    )
+    assert untyped.features is None
+    assert [batch["id"] for batch in untyped._resolve_features()] == [[0, 1], [2]]
+
+
+def test_iterable_dataset_batch_by_length_generator_resume():
+    lengths = [3, 3, 4, 1, 2, 5, 0, 9, 1, 8, 2, 7]
+
+    def make():
+        return IterableDataset.from_generator(
+            lambda: ({"id": i, "length": length, "tokens": [i] * length} for i, length in enumerate(lengths))
+        ).batch_by_length(length_column_name="length", max_length=10, batch_size=3)
+
+    expected = [batch["id"] for batch in make()]
+    assert expected == _greedy_pack_by_length(lengths, 10, 3)
+
+    for consumed in range(len(expected) + 1):
+        ds = make()
+        iterator = iter(ds)
+        seen = [next(iterator)["id"] for _ in range(consumed)]
+        state_dict = ds.state_dict()
+        resumed = make()
+        resumed.load_state_dict(state_dict)
+        rest = [batch["id"] for batch in resumed]
+        assert seen + rest == expected, (consumed, seen, rest)
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_iterable_dataset_batch_by_length_too_long_keep_resume(num_shards):
+    lengths = [2, 11, 3, 9, 12, 1, 1]
+
+    def make():
+        return IterableDataset.from_dict(
+            {"id": list(range(len(lengths))), "length": lengths}, num_shards=num_shards
+        ).batch_by_length(length_column_name="length", max_length=10, batch_size=3, too_long="keep")
+
+    expected = [batch["id"] for batch in make()]
+    assert expected == _greedy_pack_by_length(lengths, 10, 3, too_long="keep")
+
+    for consumed in range(len(expected) + 1):
+        ds = make()
+        iterator = iter(ds)
+        seen = [next(iterator)["id"] for _ in range(consumed)]
+        state_dict = ds.state_dict()
+        resumed = make()
+        resumed.load_state_dict(state_dict)
+        rest = [batch["id"] for batch in resumed]
+        assert seen + rest == expected, (consumed, seen, rest)
+
+
+def test_iterable_dataset_batch_by_length_state_contains_pending_batch_and_next_sample():
+    lengths = [6, 6, 6, 6]
+
+    def make():
+        return IterableDataset.from_dict({"id": list(range(4)), "length": lengths}).batch_by_length(
+            length_column_name="length", max_length=10, batch_size=3
+        )
+
+    ds = make()
+    iterator = iter(ds)
+    next(iterator)  # batch [0]
+    state = ds.state_dict()["examples_iterable"]
+    assert state["type"] == "LengthBatchedExamplesIterable"
+    # the state always exposes the pending batch and the pulled-but-not-output next sample;
+    # at a flush suspension the pending batch is empty and sample 1 is retained as lookahead
+    assert state["current_batch"] == {"keys": [], "examples": [], "lengths": []}
+    assert state["next_sample"] is not None
+    assert state["next_sample"]["example"] == {"id": 1, "length": 6}
+
+    # resuming from that state restarts at batch [1], without re-emitting [0]
+    resumed = make()
+    resumed.load_state_dict(ds.state_dict())
+    assert [batch["id"] for batch in resumed] == [[1], [2], [3]]
+
+    # after every batch boundary, the triggering sample is kept as lookahead
+    ds = make()
+    iterator = iter(ds)
+    next(iterator)
+    next(iterator)  # batch [1], flushed because sample 2 was pulled
+    state = ds.state_dict()["examples_iterable"]
+    assert state["current_batch"] == {"keys": [], "examples": [], "lengths": []}
+    assert state["next_sample"]["example"] == {"id": 2, "length": 6}
+
+
+def test_iterable_dataset_batch_by_length_resume_with_non_empty_pending_batch():
+    # a state holding a not-yet-output batch (and no lookahead sample) resumes by emitting it
+    from datasets.iterable_dataset import LengthBatchedExamplesIterable
+
+    def gen():
+        for i in range(4):
+            yield i, {"id": i, "length": 6}
+
+    ex_iterable = LengthBatchedExamplesIterable(
+        ExamplesIterable(gen, {}), length_column_name="length", max_length=10, batch_size=3
+    )
+    ex_iterable._init_state_dict()
+    state = ex_iterable.state_dict()
+    # the upstream iterable is positioned right after the buffered sample
+    state["examples_iterable"]["shard_example_idx"] = 1
+    state["current_batch"] = {
+        "keys": [0],
+        "examples": [{"id": 0, "length": 6}],
+        "lengths": [6],
+    }
+    state["next_sample"] = None
+    state["example_idx"] = 1
+    ex_iterable.load_state_dict(state)
+    batches = [example for _, example in ex_iterable]
+    # the pending sample is output first, then the stream continues in order
+    assert [batch["id"] for batch in batches] == [[0], [1], [2], [3]]
+
+
+def test_iterable_dataset_batch_by_length_shards():
+    n = 12
+    lengths = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 0]
+
+    def make():
+        return IterableDataset.from_dict({"id": list(range(n)), "length": lengths}, num_shards=3).batch_by_length(
+            length_column_name="length", max_length=10, batch_size=3
+        )
+
+    # sharding propagates upstream and keeps valid batches per shard
+    per_shard = [list(make().shard(num_shards=2, index=i)) for i in range(2)]
+    all_ids = [sample_id for shard in per_shard for batch in shard for sample_id in batch["id"]]
+    assert sorted(all_ids) == list(range(n))
+    for shard in per_shard:
+        for batch in shard:
+            assert len(batch["id"]) <= 3
+            assert sum(batch["length"]) <= 10
+
+    # resume inside one shard
+    ds = make().shard(num_shards=2, index=0)
+    iterator = iter(ds)
+    first = next(iterator)
+    state_dict = ds.state_dict()
+
+    def make_shard_0():
+        return make().shard(num_shards=2, index=0)
+
+    resumed = make_shard_0()
+    resumed.load_state_dict(state_dict)
+    expected = [batch["id"] for batch in make_shard_0()]
+    assert [first["id"]] + [batch["id"] for batch in resumed] == expected
+
+
 @dataclass
 class DecodableFeature:
     decode_example_num_calls = 0

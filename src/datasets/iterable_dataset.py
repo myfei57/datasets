@@ -654,6 +654,227 @@ class RebatchedArrowExamplesIterable(_BaseExamplesIterable):
         return self.ex_iterable.num_shards
 
 
+def _get_example_length(example: dict, example_idx: int, key: Key, length_column_name: str) -> int:
+    """Read and validate the non-negative integer length of an example.
+
+    The `example_idx` is the 0-based position of the example in the input stream, and the `key`
+    is its key: both are reported so errors point at the offending sample.
+    """
+    position = f"Sample at position {example_idx} (key {key!r})"
+    if not isinstance(example, dict) or length_column_name not in example:
+        raise ValueError(f"{position} is missing the length column {length_column_name!r}.")
+    value = example[length_column_name]
+    if value is None:
+        raise ValueError(f"{position} is missing a length value in column {length_column_name!r}.")
+    # bool is a subclass of int, so it must be checked separately (same for np.bool_)
+    if isinstance(value, bool) or isinstance(value, np.bool_):
+        raise ValueError(
+            f"{position} has a boolean length ({value!r}) in column {length_column_name!r}: "
+            "expected a non-negative integer."
+        )
+    if isinstance(value, np.integer):
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError(
+            f"{position} has a non-integer length ({value!r} of type "
+            f"{type(value).__name__}) in column {length_column_name!r}: expected a non-negative integer."
+        )
+    if value < 0:
+        raise ValueError(
+            f"{position} has a negative length ({value}) in column {length_column_name!r}: "
+            "expected a non-negative integer."
+        )
+    return value
+
+
+class LengthBatchedExamplesIterable(_BaseExamplesIterable):
+    """Group examples into batches under both a total length budget and a maximum number of
+    examples per batch.
+
+    Examples are packed greedily in input order (no reordering, no random access): the next
+    example is added to the current batch unless it would make the sum of the length column
+    exceed `max_length` or the number of examples reach `batch_size + 1`, in which case the
+    current batch is yielded first. The last (possibly smaller) batch is always kept.
+
+    A single example whose length exceeds `max_length` either raises an error
+    (`too_long="error"`, default) or is yielded as its own batch that preserves the original
+    example (`too_long="keep"`).
+    """
+
+    def __init__(
+        self,
+        ex_iterable: _BaseExamplesIterable,
+        length_column_name: str,
+        max_length: int,
+        batch_size: int,
+        too_long: str = "error",
+    ):
+        super().__init__()
+        if not isinstance(length_column_name, str):
+            raise TypeError("`length_column_name` must be a string corresponding to a dataset column.")
+        # use type() instead of isinstance() to reject booleans (bool is a subclass of int)
+        if type(max_length) is not int or max_length < 0:
+            raise ValueError("`max_length` must be a non-negative integer.")
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("`batch_size` must be a positive integer.")
+        if too_long not in ("error", "keep"):
+            raise ValueError("`too_long` must be either 'error' or 'keep'.")
+        self.ex_iterable = ex_iterable
+        self.length_column_name = length_column_name
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.too_long = too_long
+
+    @property
+    def is_typed(self) -> bool:
+        return self.ex_iterable.is_typed
+
+    @property
+    def features(self) -> Optional[Features]:
+        if self.ex_iterable.features is None:
+            return None
+        # output columns and nested Features are the same as for regular batching
+        return Features({col: List(feature) for col, feature in self.ex_iterable.features.items()})
+
+    def _init_state_dict(self) -> dict:
+        # `current_batch` and `next_sample` start as None (empty/no pulled sample) and are replaced
+        # by snapshots during iteration; the generic state dict loader deepcopies them back on resume.
+        self._state_dict = {
+            "examples_iterable": self.ex_iterable._init_state_dict(),
+            "current_batch": None,
+            "next_sample": None,
+            "example_idx": 0,
+            "type": self.__class__.__name__,
+        }
+        return self._state_dict
+
+    def __iter__(self):
+        if self._state_dict is not None:
+            state_dict = self._state_dict
+            current_batch = state_dict["current_batch"] or {"keys": [], "examples": [], "lengths": []}
+            buffer_keys = list(current_batch["keys"])
+            buffer_examples = list(current_batch["examples"])
+            buffer_lengths = list(current_batch["lengths"])
+            # the sample already pulled from the upstream iterable but not output yet, if any
+            next_sample = None if state_dict["next_sample"] is None else dict(state_dict["next_sample"])
+            example_idx = state_dict["example_idx"]
+        else:
+            state_dict = None
+            buffer_keys = []
+            buffer_examples = []
+            buffer_lengths = []
+            next_sample = None
+            example_idx = 0
+
+        total_length = sum(buffer_lengths)
+
+        def save_state(next_sample):
+            if state_dict is None:
+                return
+            state_dict["examples_iterable"] = self.ex_iterable.state_dict()
+            state_dict["current_batch"] = {
+                "keys": list(buffer_keys),
+                "examples": list(buffer_examples),
+                "lengths": list(buffer_lengths),
+            }
+            state_dict["next_sample"] = (
+                None
+                if next_sample is None
+                else {"key": next_sample[0], "example": next_sample[1], "length": next_sample[2]}
+            )
+            state_dict["example_idx"] = example_idx
+
+        def flush_batch():
+            nonlocal total_length
+            # the new key is the concatenation of the examples keys from the batch
+            new_key = "_".join(str(key) for key in buffer_keys)
+            batch = _examples_to_batch(buffer_examples)
+            buffer_keys.clear()
+            buffer_examples.clear()
+            buffer_lengths.clear()
+            total_length = 0
+            return new_key, batch
+
+        def pull_inputs():
+            nonlocal example_idx
+            # replay the sample already pulled when the state was saved (without re-reading upstream)
+            if next_sample is not None:
+                yield next_sample["key"], next_sample["example"], next_sample["length"]
+            for key, example in self.ex_iterable:
+                length = _get_example_length(example, example_idx, key, self.length_column_name)
+                example_idx += 1
+                yield key, example, length
+
+        for key, example, length in pull_inputs():
+            # the sample is now pulled from upstream but not output yet
+            save_state((key, example, length))
+            if length > self.max_length:
+                if self.too_long == "error":
+                    raise ValueError(
+                        f"Sample at position {example_idx - 1} (key {key!r}) has length {length} "
+                        f"which is greater than the maximum total length per batch {self.max_length}. "
+                        "Use `too_long='keep'` to output it as its own batch instead."
+                    )
+                # close the current batch first, then output the oversized sample alone,
+                # preserving the original example
+                if buffer_keys:
+                    batch_key, batch = flush_batch()
+                    save_state((key, example, length))
+                    yield batch_key, batch
+                # the oversized sample is fully output by this batch
+                single_batch = _examples_to_batch([example])
+                save_state(None)
+                yield str(key), single_batch
+                continue
+            # greedy: flush before adding the sample when either limit would be exceeded
+            if buffer_keys and (len(buffer_keys) >= self.batch_size or total_length + length > self.max_length):
+                batch_key, batch = flush_batch()
+                # the sample that triggered the flush is kept for the next batch
+                save_state((key, example, length))
+                yield batch_key, batch
+            buffer_keys.append(key)
+            buffer_examples.append(example)
+            buffer_lengths.append(length)
+            total_length += length
+            save_state(None)
+        # the last (possibly smaller) batch is always kept
+        if buffer_keys:
+            batch_key, batch = flush_batch()
+            save_state(None)
+            yield batch_key, batch
+
+    def shuffle_data_sources(self, generator: np.random.Generator) -> "LengthBatchedExamplesIterable":
+        return LengthBatchedExamplesIterable(
+            self.ex_iterable.shuffle_data_sources(generator),
+            self.length_column_name,
+            self.max_length,
+            self.batch_size,
+            self.too_long,
+        )
+
+    def shard_data_sources(self, num_shards: int, index: int, contiguous=True) -> "LengthBatchedExamplesIterable":
+        return LengthBatchedExamplesIterable(
+            self.ex_iterable.shard_data_sources(num_shards, index, contiguous=contiguous),
+            self.length_column_name,
+            self.max_length,
+            self.batch_size,
+            self.too_long,
+        )
+
+    def reshard_data_sources(self) -> "LengthBatchedExamplesIterable":
+        return LengthBatchedExamplesIterable(
+            self.ex_iterable.reshard_data_sources(),
+            self.length_column_name,
+            self.max_length,
+            self.batch_size,
+            self.too_long,
+        )
+
+    @property
+    def num_shards(self) -> int:
+        return self.ex_iterable.num_shards
+
+
 class SelectColumnsIterable(_BaseExamplesIterable):
     def __init__(self, ex_iterable: _BaseExamplesIterable, column_names: list[str]):
         super().__init__()
@@ -4722,6 +4943,107 @@ class IterableDataset(DatasetInfoMixin):
             )
         return self.map(
             _batch_fn, batched=True, batch_size=batch_size, drop_last_batch=drop_last_batch, features=features
+        )
+
+    def batch_by_length(
+        self,
+        length_column_name: str,
+        max_length: int,
+        batch_size: int,
+        too_long: str = "error",
+    ) -> "IterableDataset":
+        """
+        Group samples from the dataset into batches greedily based on a per-sample length budget.
+
+        Samples are packed in input order: the next sample is added to the current batch unless
+        it would make either the sum of the `length_column_name` column exceed `max_length` or the
+        number of samples exceed `batch_size`, in which case the current batch is output first.
+        Samples are never reordered and random access is not required.
+
+        A single sample whose length exceeds `max_length` either raises an error
+        (`too_long="error"`, default) or is output as its own batch (`too_long="keep"`).
+        The last batch is always kept, even if it is smaller than `batch_size` or its total length
+        is below `max_length`. Zero-length samples still count towards `batch_size`.
+
+        The length column of every sample must be a non-negative integer. A missing, negative,
+        boolean or non-integer value raises an error that indicates the position of the sample.
+
+        <Added version="5.2.0"/>
+
+        Args:
+            length_column_name (`str`):
+                Name of the column containing the non-negative integer length of each sample.
+            max_length (`int`):
+                Maximum sum of the length column allowed in a batch. Must be a non-negative integer.
+            batch_size (`int`):
+                Maximum number of samples in a batch. Must be a positive integer.
+            too_long (`str`, defaults to `"error"`):
+                What to do when a single sample has a length greater than `max_length`:
+
+                - `"error"` (default): raise a `ValueError`.
+                - `"keep"`: output the sample as its own batch, preserving the original sample.
+
+        Example:
+        ```py
+        >>> ds = load_dataset("some_dataset", streaming=True)  # doctest: +SKIP
+        >>> batched_ds = ds.batch_by_length(length_column_name="length", max_length=1024, batch_size=32)  # doctest: +SKIP
+        ```
+        """
+        if not isinstance(length_column_name, str):
+            raise TypeError("`length_column_name` must be a string corresponding to a dataset column.")
+        # use type() instead of isinstance() to reject booleans (bool is a subclass of int)
+        if type(max_length) is not int or max_length < 0:
+            raise ValueError("`max_length` must be a non-negative integer.")
+        if type(batch_size) is not int or batch_size <= 0:
+            raise ValueError("`batch_size` must be a positive integer.")
+        if too_long not in ("error", "keep"):
+            raise ValueError("`too_long` must be either 'error' or 'keep'.")
+        if self.features is not None and length_column_name not in self.features:
+            raise ValueError(
+                f"Length column {length_column_name!r} not found in the dataset columns {list(self.features)}."
+            )
+
+        ex_iterable = self._ex_iterable
+        # normalize the input to single plain-Python examples. User formatting (numpy/torch/arrow/...)
+        # is stripped here since the length budget is defined on raw values, like the arrow route
+        # of regular .batch(); it is applied again on the output dataset.
+        input_features = (
+            None
+            if (ex_iterable.is_typed and (self._info.features is None or self._info.features == ex_iterable.features))
+            else self._info.features
+        )
+        if self._ex_iterable.iter_arrow:
+            ex_iterable = RebatchedArrowExamplesIterable(self._ex_iterable, batch_size=1, drop_last_batch=False)
+        if self._formatting or input_features:
+            ex_iterable = FormattedExamplesIterable(
+                ex_iterable,
+                formatting=None,
+                features=input_features,
+                token_per_repo_id=self._token_per_repo_id,
+                force_convert_to_python=True,
+            )
+
+        ex_iterable = LengthBatchedExamplesIterable(
+            ex_iterable,
+            length_column_name=length_column_name,
+            max_length=max_length,
+            batch_size=batch_size,
+            too_long=too_long,
+        )
+        features = (
+            Features({col: List(feature) for col, feature in self.features.items()})
+            if self.features is not None
+            else None
+        )
+        info = self.info.copy()
+        info.features = features
+        return IterableDataset(
+            ex_iterable=ex_iterable,
+            info=info,
+            split=self._split,
+            formatting=self._formatting,
+            distributed=deepcopy(self._distributed),
+            token_per_repo_id=self._token_per_repo_id,
         )
 
     def to_dict(self, batch_size: Optional[int] = None, batched: bool = False) -> Union[dict, Iterator[dict]]:
